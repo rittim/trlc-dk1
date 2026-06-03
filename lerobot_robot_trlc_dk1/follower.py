@@ -39,6 +39,14 @@ _JOINT_LIMITS = {
     "joint_4": (-100 / 180 * np.pi, 100 / 180 * np.pi),
     "joint_5": (-90 / 180 * np.pi, 90 / 180 * np.pi),
 }
+_ARM_JOINT_LIMITS = np.array([
+    [-np.pi, np.pi],
+    [-np.pi, np.pi],
+    [-np.pi, np.pi],
+    _JOINT_LIMITS["joint_4"],
+    _JOINT_LIMITS["joint_5"],
+    [-np.pi, np.pi],
+], dtype=float)
 
 
 def _map_range(x: float, in_min: float, in_max: float, out_min: float, out_max: float) -> float:
@@ -59,6 +67,11 @@ class DK1FollowerConfig(RobotConfig):
     # Positive values push the jaws further closed; the torque controller clamps
     # safely against the physical stop. Does NOT touch motor calibration / EEPROM.
     gripper_close_offset: float = 0.0
+    # Maximum arm-joint target jump accepted per send_action call, in radians.
+    # This is a final hardware-facing guard for policy inference chunks: even if
+    # a model emits a distant absolute target, the wrapper only advances by this
+    # much from the measured joint position before the controller's own limits.
+    max_relative_target: float = 0.05
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     # POS_VEL mode only
     joint_velocity_scaling: float = 0.2
@@ -261,12 +274,33 @@ class DK1Follower(Robot):
                 obs[f"{key}.pos"] = motor.getPosition()
         return obs
 
+    def _safe_arm_goal(self, q_des: np.ndarray, current: np.ndarray) -> np.ndarray:
+        q_des = np.asarray(q_des, dtype=float)
+        current = np.asarray(current, dtype=float)
+        if q_des.shape != (6,):
+            raise ValueError(f"Expected arm goal shape (6,), got {q_des.shape}")
+        if current.shape != (6,):
+            raise ValueError(f"Expected current arm shape (6,), got {current.shape}")
+
+        finite_current = np.where(np.isfinite(current), current, 0.0)
+        safe = np.where(np.isfinite(q_des), q_des, finite_current)
+        max_relative_target = float(getattr(self.config, "max_relative_target", 0.05))
+        if max_relative_target >= 0:
+            safe = np.clip(
+                safe,
+                finite_current - max_relative_target,
+                finite_current + max_relative_target,
+            )
+        return np.clip(safe, _ARM_JOINT_LIMITS[:, 0], _ARM_JOINT_LIMITS[:, 1])
+
     def send_action(self, action: dict[str, Any]) -> dict[str, Any]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.config.control_mode == "impedance":
-            q_des = np.array([action[f"{j}.pos"] for j in JOINT_NAMES])
+            raw_q_des = np.array([action[f"{j}.pos"] for j in JOINT_NAMES], dtype=float)
+            current = self._robot.get_joint_state()["pos"]
+            q_des = self._safe_arm_goal(raw_q_des, current)
             self._robot.command_joint_pos(q_des)
             # Sync gripper close extension to underlying DK1Robot config so the
             # control loop's command-side interpolation reflects the live offset.
@@ -275,8 +309,13 @@ class DK1Follower(Robot):
             inner_cfg = getattr(self._robot, "_config", None)
             if inner_cfg is not None and hasattr(inner_cfg, "gripper_close_extra"):
                 inner_cfg.gripper_close_extra = float(self.config.gripper_close_offset)
-            self._robot.command_gripper(float(action["gripper.pos"]))
-            return action
+            gripper_pos = float(np.clip(float(action["gripper.pos"]), 0.0, 1.0))
+            self._robot.command_gripper(gripper_pos)
+            sent_action = dict(action)
+            for index, joint_name in enumerate(JOINT_NAMES):
+                sent_action[f"{joint_name}.pos"] = float(q_des[index])
+            sent_action["gripper.pos"] = gripper_pos
+            return sent_action
         else:
             return self._send_action_pos_vel(action)
 
@@ -287,6 +326,16 @@ class DK1Follower(Robot):
             if key.endswith(".pos")
         }
         vel_scale = self.config.joint_velocity_scaling
+
+        current_arm = []
+        for joint in JOINT_NAMES:
+            motor = self._motors[joint]
+            self._control.refresh_motor_status(motor)
+            current_arm.append(float(motor.getPosition()))
+        raw_arm_goal = np.array([goal_pos[joint] for joint in JOINT_NAMES], dtype=float)
+        safe_arm_goal = self._safe_arm_goal(raw_arm_goal, np.array(current_arm, dtype=float))
+        for index, joint in enumerate(JOINT_NAMES):
+            goal_pos[joint] = float(safe_arm_goal[index])
 
         for key, motor in self._motors.items():
             if key == "gripper":
@@ -302,8 +351,6 @@ class DK1Follower(Robot):
                     i_des=self.config.max_gripper_torque / _DM4310_TORQUE_CONSTANT * _EMIT_CURRENT_SCALE,
                 )
             else:
-                if key in _JOINT_LIMITS:
-                    goal_pos[key] = float(np.clip(goal_pos[key], *_JOINT_LIMITS[key]))
                 speed = _DM4310_SPEED if key in ("joint_4", "joint_5", "joint_6") else _DM4340_SPEED
                 self._control.control_Pos_Vel(motor, goal_pos[key], vel_scale * speed)
 
