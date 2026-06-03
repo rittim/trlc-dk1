@@ -55,6 +55,10 @@ class DK1FollowerConfig(RobotConfig):
     # Shared
     max_gripper_torque: float = 1.0         # Nm
     disable_torque_on_disconnect: bool = False
+    # Runtime "close-more" delta added to every gripper command (0 = no change).
+    # Positive values push the jaws further closed; the torque controller clamps
+    # safely against the physical stop. Does NOT touch motor calibration / EEPROM.
+    gripper_close_offset: float = 0.0
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
     # POS_VEL mode only
     joint_velocity_scaling: float = 0.2
@@ -134,6 +138,8 @@ class DK1Follower(Robot):
             from trlc_dk1_control import DK1Robot, DK1_DEFAULT_CONFIG
             cfg = DK1_DEFAULT_CONFIG(self.config.port)
             cfg.max_gripper_torque_nm = self.config.max_gripper_torque
+            if hasattr(cfg, "gripper_close_extra"):
+                cfg.gripper_close_extra = float(self.config.gripper_close_offset)
             self._robot = DK1Robot(cfg)
             self._robot.connect()
         else:
@@ -262,6 +268,13 @@ class DK1Follower(Robot):
         if self.config.control_mode == "impedance":
             q_des = np.array([action[f"{j}.pos"] for j in JOINT_NAMES])
             self._robot.command_joint_pos(q_des)
+            # Sync gripper close extension to underlying DK1Robot config so the
+            # control loop's command-side interpolation reflects the live offset.
+            # (command_gripper() clamps input to [0, 1], so adding to the input
+            # value does nothing past saturation — the cfg field is the lever.)
+            inner_cfg = getattr(self._robot, "_config", None)
+            if inner_cfg is not None and hasattr(inner_cfg, "gripper_close_extra"):
+                inner_cfg.gripper_close_extra = float(self.config.gripper_close_offset)
             self._robot.command_gripper(float(action["gripper.pos"]))
             return action
         else:
@@ -279,7 +292,8 @@ class DK1Follower(Robot):
             if key == "gripper":
                 self._control.refresh_motor_status(motor)
                 gripper_goal = _map_range(
-                    goal_pos[key], 0.0, 1.0,
+                    goal_pos[key] + float(self.config.gripper_close_offset),
+                    0.0, 1.0,
                     self._gripper_open_pos, self._gripper_closed_pos,
                 )
                 self._control.control_pos_force(

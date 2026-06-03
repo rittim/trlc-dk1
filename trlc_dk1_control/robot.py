@@ -250,10 +250,18 @@ class DK1Robot:
             self._motor_chain.set_arm_commands(kp, kd, q_des_safe, dq_des, tau_ff_safe)
 
             # Gripper command
+            # cfg.gripper_close_extra extends the closed end ONLY on the command
+            # side (not observation normalization in get_gripper_state). Positive
+            # values push the jaws further closed when commanded 1.0; the
+            # torque-limited controller clamps safely against the physical stop.
+            command_closed_pos = (
+                cfg.gripper_closed_pos
+                + float(cfg.gripper_close_extra) * (cfg.gripper_closed_pos - cfg.gripper_open_pos)
+            )
             gripper_q = float(np.interp(
                 gripper_des,
                 [0.0, 1.0],
-                [cfg.gripper_open_pos, cfg.gripper_closed_pos],
+                [cfg.gripper_open_pos, command_closed_pos],
             ))
             gripper_vel = DM4310_DQ_MAX * cfg.EMIT_VELOCITY_SCALE
             gripper_i_des = (

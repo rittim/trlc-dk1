@@ -80,6 +80,11 @@ class DK1RobotConfig:
     # Gripper parameters
     gripper_open_pos: float = 0.0     # rad (set by auto-calibration at startup)
     gripper_closed_pos: float = -4.7  # rad
+    # Runtime "close-more" extension (fraction of full gripper range).
+    # Applied ONLY to the command-side interpolation target so the jaws clamp
+    # further closed when commanded 1.0. Does NOT change observation
+    # normalization (so policy state inputs stay consistent with datasets).
+    gripper_close_extra: float = 0.0
     max_gripper_torque_nm: float = 1.0
     DM4310_TORQUE_CONSTANT: float = 0.945  # Nm/A
     EMIT_VELOCITY_SCALE: float = 100.0     # rad/s multiplier for EMIT mode
